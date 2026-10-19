@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""vault-doctor: health check for an Obsidian vault used as Claude's memory.
+
+This tool enforces the rules in Jobs/Vault upkeep.md so drift gets caught
+instead of accumulating. Pure stdlib, no dependencies.
+
+Usage:
+  vault-doctor                 # human-readable report on $VAULT, or ~/Vault
+  vault-doctor --json          # machine-readable, for agents
+  vault-doctor --vault PATH    # check a different vault
+  vault-doctor --stale-days N  # inbox staleness threshold (default 3)
+
+Exit codes: 0 clean (info-only findings still exit 0), 1 errors or warnings.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+SKIP_DIRS = {".obsidian", ".trash", ".git"}
+ALLOWED_ROOT_FILES = {"CLAUDE.md", "Vault Index.md", "Active Priorities.md"}
+INDEX_NAME = "Vault Index.md"
+
+# Folders exempt from needing their own `<Folder>/<Folder>.md` index note.
+# Inbox and Journal are churn by design. Add a folder here when its entry point
+# is a note one level up with the same name (Projects/Big job.md for
+# Projects/Big job/), because a second note with that name would break its links.
+NO_FOLDER_INDEX = {"Inbox", "Journal"}
+FOLDER_INDEX_MIN_NOTES = 3  # below this a folder index is more overhead than help
+
+AI_ATTRIBUTION = re.compile(
+    r"Co-Authored-By|Generated with \[?Claude|🤖 Generated", re.IGNORECASE
+)
+RELATIVE_DATES = re.compile(
+    r"\b(yesterday|tomorrow|last week|next week|last month|next month|a few days ago)\b",
+    re.IGNORECASE,
+)
+WIKILINK = re.compile(r"(!?)\[\[([^\]]+)\]\]")
+CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+
+def strip_code(text):
+    """Remove fenced blocks and inline code spans (literal examples, not prose)."""
+    return INLINE_CODE.sub("", CODE_FENCE.sub("", text))
+
+
+def vault_files(vault):
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            if f.endswith(".md"):
+                yield Path(root) / f
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--vault", default=os.environ.get("VAULT", os.path.expanduser("~/Vault")))
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--stale-days", type=int, default=3)
+    args = ap.parse_args()
+
+    vault = Path(args.vault)
+    if not (vault / INDEX_NAME).exists():
+        sys.exit(f"vault-doctor: {vault} does not look like the vault (no {INDEX_NAME})")
+
+    findings = []  # dicts: severity, check, file, line, message
+
+    def add(severity, check, file, message, line=None):
+        findings.append({
+            "severity": severity,
+            "check": check,
+            "file": str(file.relative_to(vault)) if isinstance(file, Path) else file,
+            "line": line,
+            "message": message,
+        })
+
+    notes = list(vault_files(vault))
+    # Obsidian resolves [[Name]] case-insensitively against note basenames.
+    basenames = {p.stem.lower() for p in notes}
+    attachments = {
+        p.name.lower()
+        for p in vault.rglob("*")
+        if p.is_file() and not p.name.endswith(".md")
+        and not any(part in SKIP_DIRS for part in p.parts)
+    }
+    texts = {p: p.read_text(encoding="utf-8", errors="replace") for p in notes}
+    inbound = set()  # lowercased targets that something links to
+
+    # --- root hygiene ---
+    for p in vault.iterdir():
+        if p.is_file() and p.name not in ALLOWED_ROOT_FILES and not p.name.startswith("."):
+            add("error", "root-files", p.name,
+                "Loose file in vault root. Only CLAUDE.md, Vault Index.md and "
+                "Active Priorities.md belong there.")
+
+    # --- per-note checks ---
+    for p, raw in texts.items():
+        rel = p.relative_to(vault)
+        prose = strip_code(raw)
+
+        for m in re.finditer("—", prose):
+            add("warn", "em-dash", p, "Em dash. Use a comma or full stop.",
+                line_of(prose, m.start()))
+
+        # CLAUDE.md and Jobs/ notes state the rules, so they quote the phrases.
+        if p.name != "CLAUDE.md" and str(rel.parent) != "Jobs":
+            m = AI_ATTRIBUTION.search(raw)
+            if m:
+                add("warn", "ai-attribution", p, f"AI attribution text: {m.group(0)!r}",
+                    line_of(raw, m.start()))
+
+        for m in WIKILINK.finditer(prose):
+            embed, target = m.group(1), m.group(2)
+            target = target.split("|")[0].split("#")[0].strip()
+            if not target:
+                continue
+            key = target.lower()
+            inbound.add(key)
+            if embed and "." in target:
+                if key not in attachments:
+                    add("error", "broken-link", p, f"Embedded file not found: ![[{target}]]",
+                        line_of(prose, m.start()))
+            elif key not in basenames:
+                add("error", "broken-link", p, f"Broken wikilink: [[{target}]]",
+                    line_of(prose, m.start()))
+
+        # Jobs/ prose legitimately says "yesterday" etc. as generic advice
+        # rather than as a date.
+        if str(rel.parent) != "Jobs":
+            for m in RELATIVE_DATES.finditer(prose):
+                add("info", "relative-date", p,
+                    f"Relative date {m.group(0)!r}. Vault dates should be absolute.",
+                    line_of(prose, m.start()))
+
+    # --- inbox staleness ---
+    inbox = vault / "Inbox"
+    if inbox.is_dir():
+        now = time.time()
+        for p in inbox.glob("*.md"):
+            age_days = (now - p.stat().st_mtime) / 86400
+            if age_days > args.stale_days:
+                add("warn", "inbox-stale", p,
+                    f"Sitting in Inbox for {age_days:.0f} days. File it and delete the capture.")
+
+    # --- index drift ---
+    index_text = texts[vault / INDEX_NAME]
+    top_dirs = [d.name for d in vault.iterdir() if d.is_dir() and d.name not in SKIP_DIRS]
+    for d in top_dirs:
+        if (f"{d}/" not in index_text and f"**{d}" not in index_text
+                and f"[[{d}]]" not in index_text):
+            add("error", "index-drift", INDEX_NAME,
+                f"Folder '{d}/' exists but is not mentioned in the index map.")
+    for m in re.finditer(r"`([^`\n]+\.md)`", index_text):
+        name = m.group(1)
+        hits = [p for p in notes if p.name == name]
+        if not hits and "/" not in name:
+            add("error", "index-drift", INDEX_NAME,
+                f"Index references `{name}` but no such note exists.",
+                line_of(index_text, m.start()))
+
+    # --- folder indexes (every folder with real content maps its own notes) ---
+    folders = {}
+    for p in notes:
+        rel = p.relative_to(vault)
+        if len(rel.parts) < 2:
+            continue
+        folders.setdefault(str(rel.parent), []).append(p)
+
+    for folder, members in sorted(folders.items()):
+        if folder in NO_FOLDER_INDEX:
+            continue
+        idx = vault / folder / (Path(folder).name + ".md")
+        content = [p for p in members if p != idx]
+        if len(content) < FOLDER_INDEX_MIN_NOTES:
+            continue
+        if not idx.exists():
+            add("error", "folder-index", f"{folder}/",
+                f"Folder has {len(content)} notes but no index note "
+                f"`{Path(folder).name}.md`. Create it and list every note.")
+            continue
+        idx_text = texts[idx]
+        for p in sorted(content):
+            if p.stem.lower() not in {t.lower() for t in
+                                      (m.group(2).split("|")[0].split("#")[0].strip()
+                                       for m in WIKILINK.finditer(idx_text))} \
+                    and p.stem not in idx_text:
+                add("warn", "folder-index", idx,
+                    f"`{p.name}` is in this folder but not listed in its index.")
+        # subfolders should at least be mentioned, so they are not invisible
+        for d in sorted({str(Path(f)) for f in folders if Path(f).parent == Path(folder)}):
+            name = Path(d).name
+            if name not in idx_text:
+                add("warn", "folder-index", idx,
+                    f"Subfolder `{name}/` exists but is not mentioned in this index.")
+
+    # --- orphans (never linked, not in index) ---
+    for p in notes:
+        rel = p.relative_to(vault)
+        if p.name in ALLOWED_ROOT_FILES or rel.parts[0] in ("Inbox", "Journal"):
+            continue
+        if p.stem.lower() not in inbound and p.stem not in index_text:
+            add("info", "orphan", p, "No inbound wikilinks and not named in the index.")
+
+    # --- output ---
+    order = {"error": 0, "warn": 1, "info": 2}
+    findings.sort(key=lambda f: (order[f["severity"]], f["file"], f["line"] or 0))
+    errors = sum(1 for f in findings if f["severity"] == "error")
+    warns = sum(1 for f in findings if f["severity"] == "warn")
+    infos = sum(1 for f in findings if f["severity"] == "info")
+
+    if args.json:
+        print(json.dumps({"vault": str(vault), "errors": errors, "warns": warns,
+                          "infos": infos, "findings": findings}, indent=2))
+    else:
+        if not findings:
+            print(f"vault-doctor: {vault} is clean ({len(notes)} notes checked).")
+        for f in findings:
+            loc = f["file"] + (f":{f['line']}" if f["line"] else "")
+            print(f"[{f['severity'].upper():5}] {f['check']:14} {loc}\n        {f['message']}")
+        if findings:
+            print(f"\n{errors} errors, {warns} warnings, {infos} info "
+                  f"({len(notes)} notes checked).")
+
+    sys.exit(1 if errors or warns else 0)
+
+
+if __name__ == "__main__":
+    main()

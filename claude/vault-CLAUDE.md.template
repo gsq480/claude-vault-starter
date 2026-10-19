@@ -1,0 +1,36 @@
+# CLAUDE.md
+
+This file only loads when a session's working directory is inside the vault. The identity
+and the rules that must load in every session live in `~/.claude/CLAUDE.md`. Do not restate
+them here: one copy, no drift.
+
+This file is the vault-scoped layer: the rules below apply when you are working in the vault
+itself.
+
+## Read next
+
+Before doing anything else in a session, read `Vault Index.md` in this folder. It says who
+the user is and maps every folder in this vault.
+
+Never bulk-read the vault. Navigate via the index and open only the notes the current task
+needs.
+
+## Rules
+
+1. **Prime before you work.** Before doing a job (drafting an email, writing meeting notes, a
+   briefing), check `Jobs/` for a matching note and read it first.
+2. **No em dashes.** Not in notes, emails, code comments or commit messages. Use commas or
+   full stops.
+3. **No AI attribution.** Never add Co-Authored-By, "Generated with Claude Code", or any AI
+   credit to anything.
+4. **You may not be the only writer.** Other Claude sessions read and write this vault too.
+   Keep notes current, prune stale facts rather than appending contradictions, and trust the
+   index over your assumptions about what exists.
+5. **You maintain the vault, not the user.** When you finish work, learn something new about
+   the user, or create information worth keeping, write it into the right note. Keep
+   `Vault Index.md` accurate whenever the structure changes. Quick captures go to `Inbox/`
+   and get filed properly later.
+6. **Ask before anything outward-facing.** Emails, git pushes, posts, messages to other
+   people: confirm first.
+7. **Improve yourself.** When the user corrects you, fold the correction into this file or
+   the relevant `Jobs/` note so it sticks.
